@@ -1,177 +1,163 @@
-// makefun-news-image-20261118 — entry program.
+// news-image-20261118 — round 2 entry builder.
 //
-// What this program does, in one sentence: it reads the front-page image
-// `entry.png` that ships in this repository, checks that it is a whole,
-// well-formed PNG inside the competition limits, and copies it byte for
-// byte to `<output dir>/entry.png`.
+// Reads the validated front-page image (entry.png) that sits next to this
+// script, checks that it is a well-formed PNG within the competition limits,
+// and copies it unchanged into the output directory.
 //
-// The output directory comes from the MAKEFUN_OUTPUT_DIR environment
-// variable when it is set (that is how the entry is run locally), and
-// defaults to `/output`, which is where the make.fun grader expects the
-// image. Nothing here touches the network, and nothing is random: the
-// same input file always produces the same output bytes, so two runs
-// of this program write identical files.
+// Usage:
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 //
-// Only the Node.js standard library is used: `node:fs` for reading and
-// writing files, `node:path` for joining paths, and `node:zlib` for the
-// CRC-32 checks that prove every PNG chunk is intact.
+// The output directory comes from MAKEFUN_OUTPUT_DIR and defaults to ./out.
+// The output file is always named entry.png. Only Node.js built-in modules
+// are used, and no network access is needed.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { crc32 } from "node:zlib";
+import { fileURLToPath } from "node:url";
 
-// The competition caps: at most 1 MiB (1048576 bytes) and at most
-// 1024 by 1024 pixels. Anything bigger is refused, never truncated,
-// because silently shrinking the image would change what the judge sees.
-const MAX_BYTES = 1024 * 1024;
+const MAX_BYTES = 1048576;
 const MAX_WIDTH = 1024;
 const MAX_HEIGHT = 1024;
+const OUTPUT_NAME = "entry.png";
 
-// The eight-byte PNG signature every PNG file must start with.
-// Checking it first keeps a misnamed JPEG (or any other file) from
-// ever being passed off as this entry's PNG.
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-// Where the source image lives: next to this program, in the root of
-// the repository. `import.meta.url` keeps the lookup correct no matter
-// which working directory the program is started from.
-const SOURCE_PATH = resolve(dirname(new URL(import.meta.url).pathname), "entry.png");
+// CRC-32 (IEEE 802.3, polynomial 0xedb88320), built from scratch so the
+// program needs no external dependency. The table is generated once at
+// startup by shifting each byte value through the polynomial.
+const CRC_TABLE = buildCrcTable();
 
-// Where the validated copy goes. The grader runs with a writable
-// `/output`; local runs set MAKEFUN_OUTPUT_DIR to a scratch folder.
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-const OUTPUT_PATH = join(OUTPUT_DIR, "entry.png");
+function buildCrcTable(): Uint32Array {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) !== 0 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+}
 
-// Fail loudly with a clear message instead of writing a bad file.
+function crc32(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i += 1) {
+    crc = CRC_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function fail(message: string): never {
-  throw new Error(`makefun-news-image-20261118: ${message}`);
+  console.error(`error: ${message}`);
+  process.exit(1);
 }
 
-// Read one unsigned 32-bit big-endian integer out of a buffer.
-function readU32(buffer: Buffer, offset: number): number {
-  return buffer.readUInt32BE(offset);
-}
-
-// Walk every chunk of the PNG and check its CRC-32. A PNG is a chain
-// of chunks — length, four-letter type, payload, CRC — and the CRC
-// covers the type bytes plus the payload. Any chunk whose stored CRC
-// does not match the computed one means the file is damaged or was
-// cut short, so the run stops before anything is copied.
-//
-// The walk also collects the width and height from the IHDR chunk
-// (the first chunk, whose 13-byte payload starts with width then
-// height), and insists on seeing exactly one IHDR first and one IEND
-// chunk last, so a file that is only a header, or one with trailing
-// junk after IEND, is refused as well.
-function validatePng(bytes: Buffer): { width: number; height: number } {
-  if (bytes.length < PNG_SIGNATURE.length) {
-    fail(`entry.png is only ${bytes.length} bytes, shorter than the PNG signature`);
-  }
-  if (!bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
-    fail("entry.png does not start with the PNG signature");
-  }
-  if (bytes.length > MAX_BYTES) {
-    fail(`entry.png is ${bytes.length} bytes, over the ${MAX_BYTES} byte limit`);
-  }
-
+// Walk every chunk of the PNG, verifying each chunk's CRC-32 and that the
+// IEND chunk exists and is the very last chunk. Returns the IHDR width and
+// height so the caller can enforce the size limits.
+function checkChunks(data: Buffer): { width: number; height: number } {
   let offset = PNG_SIGNATURE.length;
   let width = 0;
   let height = 0;
   let sawIhdr = false;
-  let sawIend = false;
-  let chunkIndex = 0;
+  let sawIdat = false;
+  let chunkCount = 0;
 
-  while (offset < bytes.length) {
-    // Every chunk needs at least 12 bytes: 4 for length, 4 for type,
-    // 4 for the CRC (a zero-length payload still has those 12).
-    if (offset + 12 > bytes.length) {
-      fail(`PNG ends mid-chunk at byte ${offset}`);
+  while (offset < data.length) {
+    if (offset + 8 > data.length) {
+      fail(`truncated chunk header at byte offset ${offset}`);
     }
-    const length = readU32(bytes, offset);
-    const type = bytes.subarray(offset + 4, offset + 8).toString("ascii");
+    const length = data.readUInt32BE(offset);
+    const type = data.toString("ascii", offset + 4, offset + 8);
     const dataStart = offset + 8;
     const dataEnd = dataStart + length;
-    const crcStart = dataEnd;
-    if (dataEnd + 4 > bytes.length) {
-      fail(`chunk ${type} at byte ${offset} claims ${length} bytes but the file ends first`);
+    if (dataEnd + 4 > data.length) {
+      fail(`chunk ${type} at offset ${offset} claims ${length} bytes but the file ends early`);
     }
-
-    // CRC-32 over the chunk type and its payload, compared with the
-    // four CRC bytes stored right after the payload.
-    const expected = readU32(bytes, crcStart);
-    const actual = crc32(bytes.subarray(offset + 4, dataEnd));
-    if (actual !== expected) {
-      fail(`chunk ${type} at byte ${offset} has a bad CRC (stored ${expected}, computed ${actual})`);
+    const storedCrc = data.readUInt32BE(dataEnd);
+    const actualCrc = crc32(data.subarray(offset + 4, dataEnd));
+    if (storedCrc !== actualCrc) {
+      fail(`chunk ${type} at offset ${offset} has a bad CRC (stored ${storedCrc}, computed ${actualCrc})`);
     }
+    chunkCount += 1;
 
-    if (chunkIndex === 0) {
-      // The first chunk must be IHDR, and it must be exactly 13 bytes.
-      if (type !== "IHDR" || length !== 13) {
-        fail(`first chunk is ${type} (${length} bytes), expected a 13-byte IHDR`);
+    if (type === "IHDR") {
+      if (chunkCount !== 1) {
+        fail("IHDR must be the first chunk");
       }
+      if (length !== 13) {
+        fail(`IHDR must be 13 bytes long, got ${length}`);
+      }
+      width = data.readUInt32BE(dataStart);
+      height = data.readUInt32BE(dataStart + 4);
       sawIhdr = true;
-      width = readU32(bytes, dataStart);
-      height = readU32(bytes, dataStart + 4);
-      if (width === 0 || height === 0) {
-        fail(`IHDR reports zero size (${width}x${height})`);
-      }
-      if (width > MAX_WIDTH || height > MAX_HEIGHT) {
-        fail(`image is ${width}x${height}, over the ${MAX_WIDTH}x${MAX_HEIGHT} limit`);
-      }
     }
+
+    if (type === "IDAT") {
+      if (!sawIhdr) {
+        fail("IDAT found before any IHDR chunk");
+      }
+      if (length === 0) {
+        fail(`empty IDAT chunk at offset ${offset}`);
+      }
+      sawIdat = true;
+    }
+
     if (type === "IEND") {
       if (length !== 0) {
-        fail("IEND chunk must be empty");
+        fail(`IEND must be empty, got ${length} bytes`);
       }
-      sawIend = true;
-      // IEND is the last chunk: anything after it is trailing junk.
-      if (crcStart + 4 !== bytes.length) {
-        fail(`file has ${bytes.length - (crcStart + 4)} trailing bytes after IEND`);
+      if (!sawIdat) {
+        fail("no IDAT chunk found; the PNG carries no image data");
       }
+      if (dataEnd + 4 !== data.length) {
+        fail("IEND must be the last chunk, but trailing bytes follow it");
+      }
+      if (!sawIhdr) {
+        fail("IEND found before any IHDR chunk");
+      }
+      return { width, height };
     }
 
-    chunkIndex += 1;
-    offset = crcStart + 4;
+    offset = dataEnd + 4;
   }
 
-  if (!sawIhdr) {
-    fail("PNG has no IHDR chunk");
-  }
-  if (!sawIend) {
-    fail("PNG has no IEND chunk");
-  }
-  return { width, height };
+  fail("no IEND chunk found; the PNG is truncated");
 }
 
 function main(): void {
-  if (!existsSync(SOURCE_PATH)) {
-    fail(`source image not found at ${SOURCE_PATH}`);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sourcePath = join(here, "entry.png");
+  if (!existsSync(sourcePath)) {
+    fail(`source image not found: ${sourcePath}`);
   }
-  const size = statSync(SOURCE_PATH).size;
+
+  const size = statSync(sourcePath).size;
   if (size > MAX_BYTES) {
     fail(`entry.png is ${size} bytes, over the ${MAX_BYTES} byte limit`);
   }
-
-  const bytes = readFileSync(SOURCE_PATH);
-  const { width, height } = validatePng(bytes);
-
-  // The destination folder may not exist yet (a fresh local `out/`
-  // folder, for example), so create it, including any parents.
-  mkdirSync(OUTPUT_DIR, { recursive: true });
-
-  // A plain byte-for-byte copy: the output is the input, unchanged,
-  // which is what makes repeated runs deterministic.
-  copyFileSync(SOURCE_PATH, OUTPUT_PATH);
-
-  // Prove the copy landed whole: re-read it and compare it byte for
-  // byte with the source, so a short write or a disk hiccup is caught
-  // here, not by the grader.
-  const writtenBytes = readFileSync(OUTPUT_PATH);
-  if (!writtenBytes.equals(bytes)) {
-    fail(`copy at ${OUTPUT_PATH} differs from the source image`);
+  if (size < PNG_SIGNATURE.length + 25) {
+    fail(`entry.png is only ${size} bytes, too small to be a valid PNG`);
   }
-  const written = writtenBytes.length;
-  console.log(`wrote ${OUTPUT_PATH} (${width}x${height}, ${written} bytes)`);
+
+  const data = readFileSync(sourcePath);
+  if (!data.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    fail("entry.png does not start with the PNG signature 89 50 4E 47 0D 0A 1A 0A");
+  }
+
+  const { width, height } = checkChunks(data);
+  if (width > MAX_WIDTH || height > MAX_HEIGHT) {
+    fail(`entry.png is ${width}x${height}, over the ${MAX_WIDTH}x${MAX_HEIGHT} limit`);
+  }
+  if (width === 0 || height === 0) {
+    fail(`entry.png has an invalid size of ${width}x${height}`);
+  }
+
+  const outDir = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? "./out");
+  mkdirSync(outDir, { recursive: true });
+  const outPath = join(outDir, OUTPUT_NAME);
+  copyFileSync(sourcePath, outPath);
+  console.log(`wrote ${outPath} (${width}x${height}, ${size} bytes)`);
 }
 
 main();
